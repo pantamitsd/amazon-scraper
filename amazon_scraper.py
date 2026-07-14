@@ -35,6 +35,21 @@ DELAY = (1.5, 3.0)
 INPUT_FILE = "queries.xlsx"
 OUTPUT_FILE = "output.xlsx"
 
+# CHANGED FOR GITHUB ACTIONS (large lists / timeout safety):
+# With hundreds of URLs, a single Actions run can hit the job's time limit
+# before the loop finishes. Since the original script only wrote the output
+# file once at the very end, a mid-run timeout meant losing all progress.
+# Two things fix that:
+#   1. SAVE_EVERY: write output.xlsx to disk every N rows, not just at the end.
+#   2. MAX_RUNTIME_SECONDS: stop scraping (and do a final save) a bit before
+#      the workflow step's own timeout, so the "commit and push" step always
+#      has a valid, up-to-date output.xlsx to push, run after run.
+# Rows already marked status == "OK" from a previous run are skipped, so the
+# NEXT scheduled run automatically continues where this one left off instead
+# of re-scraping everything from row 1.
+SAVE_EVERY = 20
+MAX_RUNTIME_SECONDS = 50 * 60  # 50 minutes; keep below the workflow step timeout
+
 # Regex patterns
 CURR_RX = re.compile(r"(?:₹|Rs\.?)\s*([\d,]+)")
 STAR_RX = re.compile(r"([0-5](?:\.\d)?)")
@@ -286,37 +301,90 @@ def extract_stock_message(soup: BeautifulSoup):
     return "N/A"
 
 
-# ========== SCRAPER (file-based, GitHub Actions entrypoint) ==========
-def scrape_amazon_file(input_path: str):
-    """
-    Reads queries.xlsx/csv with 'url'/'Link' column, scrapes each product page,
-    and writes selling_price, stars, reviews, stock_message, status, error.
+def _detect_link_col(df):
+    for cand in ("url", "Url", "URL", "link", "Link", "LinkUrl", "amazon_link", "Link "):
+        if cand in df.columns:
+            return cand
+    return None
 
-    This function is functionally identical to the original
-    scrape_amazon_file(uploaded_file), except:
-      - it takes a file PATH instead of a Streamlit UploadedFile object
-      - st.error(...) -> print(...) / raise
-      - st.progress(...) -> print(...) progress lines
+
+def _load_working_dataframe(input_path: str, output_path: str):
+    """
+    Builds the dataframe to work on for this run.
+
+    - Always reads queries.xlsx fresh, so it stays the source of truth for
+      which rows/columns (e.g. 'Seller SKU') should exist and in what order.
+    - If output.xlsx already exists (from a previous run that got cut off,
+      or a previous scheduled run), carries forward any row whose status was
+      already "OK" by matching on the normalized URL, so those rows are NOT
+      re-scraped. Everything else (new rows, previously FAILed rows, blank
+      rows) will be (re)scraped this run.
     """
     if input_path.lower().endswith(".csv"):
         df = pd.read_csv(input_path)
     else:
         df = pd.read_excel(input_path)
 
-    # detect link column
-    link_col = None
-    for cand in ("url", "Url", "URL", "link", "Link", "LinkUrl", "amazon_link", "Link "):
-        if cand in df.columns:
-            link_col = cand
-            break
+    link_col = _detect_link_col(df)
     if not link_col:
         print(f"ERROR: '{input_path}' must contain a 'url' or 'Link' column.")
         sys.exit(1)
 
-    # ensure columns exist
     for c in ["selling_price", "stars", "reviews", "stock_message", "status", "error"]:
         if c not in df.columns:
             df[c] = None
+
+    if os.path.exists(output_path):
+        try:
+            prev = pd.read_excel(output_path)
+            prev_link_col = _detect_link_col(prev)
+            if prev_link_col:
+                done_rows = {}
+                for _, row in prev.iterrows():
+                    if str(row.get("status", "")).strip() == "OK":
+                        key = normalize_amazon_url(str(row[prev_link_col]))
+                        done_rows[key] = row
+                if done_rows:
+                    carried = 0
+                    for idx, raw in df[link_col].astype(str).items():
+                        key = normalize_amazon_url(raw)
+                        if key in done_rows:
+                            prev_row = done_rows[key]
+                            for c in ["selling_price", "stars", "reviews", "stock_message", "status", "error"]:
+                                if c in prev_row:
+                                    df.loc[idx, c] = prev_row[c]
+                            carried += 1
+                    print(f"Resuming: {carried} row(s) already OK from a previous run, skipping those.")
+        except Exception as e:
+            print(f"Could not read previous {output_path}, starting fresh ({e}).")
+
+    return df, link_col
+
+
+# ========== SCRAPER (file-based, GitHub Actions entrypoint, resume-aware) ==========
+def scrape_amazon_file(input_path: str, output_path: str):
+    """
+    Reads queries.xlsx/csv with 'url'/'Link' column, scrapes each product page
+    not already marked "OK" in output.xlsx, and writes/updates
+    selling_price, stars, reviews, stock_message, status, error.
+
+    All original extraction/retry/delay logic is UNCHANGED from the
+    Streamlit version. What's new here (for GitHub Actions + large lists):
+      - resumes from output.xlsx instead of re-scraping everything each run
+      - saves progress to disk every SAVE_EVERY rows
+      - stops (with a final save) after MAX_RUNTIME_SECONDS so a run never
+        gets killed mid-way with nothing written
+    """
+    df, link_col = _load_working_dataframe(input_path, output_path)
+
+    total = len(df)
+    pending_mask = df["status"].astype(str) != "OK"
+    pending_count = int(pending_mask.sum())
+    print(f"{total} total row(s), {pending_count} pending (not yet OK).")
+
+    if pending_count == 0:
+        print("Nothing left to scrape — all rows already OK.")
+        return df
 
     # build driver
     d = build_driver()
@@ -329,10 +397,18 @@ def scrape_amazon_file(input_path: str):
     except Exception:
         pass
 
+    start_time = time.time()
+    processed = 0
     try:
-        total = len(df)
-        print(f"Starting scrape of {total} URL(s)…")
         for count, (idx, raw) in enumerate(df[link_col].astype(str).items(), start=1):
+            if str(df.loc[idx, "status"]) == "OK":
+                continue  # already scraped in a previous run
+
+            if time.time() - start_time > MAX_RUNTIME_SECONDS:
+                print("Time budget reached for this run — stopping early and saving progress. "
+                      "Remaining rows will be picked up on the next scheduled run.")
+                break
+
             url = normalize_amazon_url(raw)
             if not (url and url.startswith("http")):
                 df.loc[idx, ["status", "error"]] = ["FAIL", "Bad/empty URL"]
@@ -357,19 +433,28 @@ def scrape_amazon_file(input_path: str):
                 err = str(e)[:400]
                 df.loc[idx, ["status", "error"]] = ["FAIL", err]
                 print(f"[{count}/{total}] FAIL -> {url} ({err})")
+
+            processed += 1
+            if processed % SAVE_EVERY == 0:
+                df.to_excel(output_path, index=False)
+                print(f"Progress saved to {output_path} ({processed} row(s) processed this run).")
+
             # polite delay between requests
             time.sleep(random.uniform(*DELAY))
     finally:
         safe_quit(d)
         time.sleep(0.2)
+
     return df
 
 
 # ========== ENTRYPOINT (replaces Streamlit main()) ==========
 def main():
-    out = scrape_amazon_file(INPUT_FILE)
+    out = scrape_amazon_file(INPUT_FILE, OUTPUT_FILE)
     out.to_excel(OUTPUT_FILE, index=False)
-    print(f"Done. Wrote {len(out)} row(s) to {OUTPUT_FILE}")
+    remaining = int((out["status"].astype(str) != "OK").sum())
+    print(f"Done for this run. Wrote {len(out)} row(s) to {OUTPUT_FILE}. "
+          f"{remaining} row(s) still pending" + (" — next scheduled run will continue." if remaining else "."))
 
 
 if __name__ == "__main__":
