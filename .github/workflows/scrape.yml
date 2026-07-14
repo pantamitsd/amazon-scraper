@@ -57,7 +57,8 @@ jobs:
         continue-on-error: true
         env:
           CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
-        run: python amazon_scraper.py
+          PYTHONUNBUFFERED: "1"   # forces print() to flush immediately so logs stream live instead of buffering
+        run: python -u amazon_scraper.py
 
       - name: Commit and push output.xlsx
         if: always()   # push whatever progress exists even if the scraper step above timed out/errored
