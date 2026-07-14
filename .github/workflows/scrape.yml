@@ -1,1 +1,73 @@
+name: Amazon Scraper
 
+on:
+  workflow_dispatch: {}        # manual "Run workflow" button
+  schedule:
+    - cron: "0 */6 * * *"      # every 6 hours (edit as needed)
+
+# Required so the job can push output.xlsx back to the repo
+permissions:
+  contents: write
+
+concurrency:
+  group: amazon-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # No job-level timeout here on purpose — it's set on the "Run scraper"
+    # step instead. A job-level timeout kills the WHOLE job, including the
+    # commit/push step, so any progress made would never get saved to the
+    # repo. A step-level timeout only fails that one step; the commit step
+    # below runs anyway (if: always()) and pushes whatever output.xlsx has
+    # been saved so far.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Installs the current stable Google Chrome and exposes its path.
+      # undetected_chromedriver auto-detects the installed Chrome's major
+      # version and pulls a matching chromedriver, so we don't need a
+      # separate "install chromedriver" step.
+      - name: Install Google Chrome
+        uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+
+      - name: Show installed Chrome version
+        run: ${{ steps.setup-chrome.outputs.chrome-path }} --version
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        timeout-minutes: 55   # scraper stops itself at 50 min (MAX_RUNTIME_SECONDS); this is a hard backstop
+        continue-on-error: true
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: python amazon_scraper.py
+
+      - name: Commit and push output.xlsx
+        if: always()   # push whatever progress exists even if the scraper step above timed out/errored
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output.xlsx
+          if git diff --staged --quiet; then
+            echo "No changes to output.xlsx, skipping commit."
+          else
+            git commit -m "Auto-update output.xlsx [skip ci]"
+            git push
+          fi
